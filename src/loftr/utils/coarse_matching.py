@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops.einops import rearrange
-
+import pdb
 INF = 1e9
 
 def mask_border(m, b: int, v):
@@ -84,7 +84,7 @@ class CoarseMatching(nn.Module):
         else:
             raise NotImplementedError()
 
-    def forward(self, feat_c0, feat_c1, data, mask_c0=None, mask_c1=None):
+    def forward(self, feat_c0, feat_c1, data, mask_c0=None, mask_c1=None, attention_bias=None):
         """
         Args:
             feat0 (torch.Tensor): [N, L, C]
@@ -92,6 +92,10 @@ class CoarseMatching(nn.Module):
             data (dict)
             mask_c0 (torch.Tensor): [N, L] (optional)
             mask_c1 (torch.Tensor): [N, S] (optional)
+            attention_bias (torch.Tensor): [N, L, S] (optional) - bias from refined matches
+                This allows feeding back refined match distributions (e.g., from diffusion)
+                to influence the coarse matching. Typically computed as γ * log(M̃ + ε)
+                where M̃ is the refined soft match matrix.
         Update:
             data (dict): {
                 'b_ids' (torch.Tensor): [M'],
@@ -112,6 +116,11 @@ class CoarseMatching(nn.Module):
         if self.match_type == 'dual_softmax':
             sim_matrix = torch.einsum("nlc,nsc->nls", feat_c0,
                                       feat_c1) / self.temperature
+            
+            # Add attention bias from refined matches (for iterative refinement, bidirectional feedback)
+            if attention_bias is not None:
+                sim_matrix = sim_matrix + attention_bias
+            
             if mask_c0 is not None:
                 sim_matrix.masked_fill_(
                     ~(mask_c0[..., None] * mask_c1[:, None]).bool(),
@@ -121,6 +130,11 @@ class CoarseMatching(nn.Module):
         elif self.match_type == 'sinkhorn':
             # sinkhorn, dustbin included
             sim_matrix = torch.einsum("nlc,nsc->nls", feat_c0, feat_c1)
+            
+            # Add attention bias from refined matches (for iterative refinement)
+            if attention_bias is not None:
+                sim_matrix = sim_matrix + attention_bias
+            
             if mask_c0 is not None:
                 sim_matrix[:, :L, :S].masked_fill_(
                     ~(mask_c0[..., None] * mask_c1[:, None]).bool(),
@@ -146,7 +160,69 @@ class CoarseMatching(nn.Module):
 
         # predict coarse matches from conf_matrix
         data.update(**self.get_coarse_match(conf_matrix, data))
+        
+        data.update(**self.get_contextual_match(conf_matrix, data, feat_c0, feat_c1))
+        
+        a=1
 
+    @torch.no_grad()
+    def get_contextual_match(self, conf_matrix, data, desc0, desc1):
+        """
+        Save coarse grid keypoints (for every token) in original image coordinates,
+        aligned with desc0/desc1 which are [B, L, C] and [B, S, C].
+        """
+
+        B, L, C = desc0.shape
+        _, S, _ = desc1.shape
+
+        h0c, w0c = data["hw0_c"]
+        h1c, w1c = data["hw1_c"]
+        assert L == h0c * w0c, f"L={L} != h0c*w0c={h0c*w0c}"
+        assert S == h1c * w1c, f"S={S} != h1c*w1c={h1c*w1c}"
+
+        device = desc0.device
+
+        # --- 1) build ALL coarse-grid (x,y) coordinates for view0 and view1 ---
+        # indices: [L]
+        i_ids = torch.arange(L, device=device)
+        j_ids = torch.arange(S, device=device)
+
+        # coarse coords in (x,y): [L,2], [S,2]
+        kpts0_c = torch.stack([i_ids % w0c, i_ids // w0c], dim=1).float()
+        kpts1_c = torch.stack([j_ids % w1c, j_ids // w1c], dim=1).float()
+
+        # --- 2) scale to original image resolution (LoFTR-style) ---
+        # scale from coarse grid to image pixels (assumes uniform stride)
+        scale0 = data["hw0_i"][0] / float(h0c)  # e.g. 1024/128 = 8
+        scale1 = data["hw1_i"][0] / float(h1c)
+
+        # If per-sample scaling exists (rare), apply it
+        if "scale0" in data:
+            # data["scale0"]: [B] → [B,1,1] for broadcast
+            s0 = (scale0 * data["scale0"]).view(B, 1, 1)
+        else:
+            s0 = torch.full((B, 1, 1), scale0, device=device)
+
+        if "scale1" in data:
+            s1 = (scale1 * data["scale1"]).view(B, 1, 1)
+        else:
+            s1 = torch.full((B, 1, 1), scale1, device=device)
+
+        # expand coords to batch: [B,L,2], [B,S,2]
+        keypoints0 = kpts0_c[None].repeat(B, 1, 1) * s0
+        keypoints1 = kpts1_c[None].repeat(B, 1, 1) * s1
+
+        # --- 3) save into data (and return dict) ---
+        contextual = {
+            "conf_matrix": conf_matrix,      # [B, L, S]
+            "descriptors0": desc0,           # [B, L, C] - LoFTR coarse features after transformer
+            "descriptors1": desc1,           # [B, S, C] - LoFTR coarse features after transformer
+            "keypoints0": keypoints0,        # [B, L, 2] in original image pixels - dense coarse grid
+            "keypoints1": keypoints1,        # [B, S, 2] in original image pixels - dense coarse grid
+        }
+        return contextual
+
+    
     @torch.no_grad()
     def get_coarse_match(self, conf_matrix, data):
         """
@@ -163,6 +239,7 @@ class CoarseMatching(nn.Module):
                 'mkpts0_c' (torch.Tensor): [M, 2],
                 'mkpts1_c' (torch.Tensor): [M, 2],
                 'mconf' (torch.Tensor): [M]}
+                M  = total number of coarse matches across the batch 
         """
         axes_lengths = {
             'h0c': data['hw0_c'][0],
@@ -187,6 +264,7 @@ class CoarseMatching(nn.Module):
         mask = mask \
             * (conf_matrix == conf_matrix.max(dim=2, keepdim=True)[0]) \
             * (conf_matrix == conf_matrix.max(dim=1, keepdim=True)[0])
+            
 
         # 3. find all valid coarse matches
         # this only works when at most one `True` in each row
@@ -194,7 +272,7 @@ class CoarseMatching(nn.Module):
         b_ids, i_ids = torch.where(mask_v)
         j_ids = all_j_ids[b_ids, i_ids]
         mconf = conf_matrix[b_ids, i_ids, j_ids]
-
+        
         # 4. Random sampling of training samples for fine-level LoFTR
         # (optional) pad samples with gt coarse-level matches
         if self.training:
@@ -222,18 +300,18 @@ class CoarseMatching(nn.Module):
                     device=_device)
 
             # gt_pad_indices is to select from gt padding. e.g. max(3787-4800, 200)
-            gt_pad_indices = torch.randint(
-                    len(data['spv_b_ids']),
-                    (max(num_matches_train - num_matches_pred,
-                        self.train_pad_num_gt_min), ),
-                    device=_device)
-            mconf_gt = torch.zeros(len(data['spv_b_ids']), device=_device)  # set conf of gt paddings to all zero
+            # gt_pad_indices = torch.randint(
+            #         len(data['spv_b_ids']),
+            #         (max(num_matches_train - num_matches_pred,
+            #             self.train_pad_num_gt_min), ),
+            #         device=_device)
+            # mconf_gt = torch.zeros(len(data['spv_b_ids']), device=_device)  # set conf of gt paddings to all zero
 
-            b_ids, i_ids, j_ids, mconf = map(
-                lambda x, y: torch.cat([x[pred_indices], y[gt_pad_indices]],
-                                       dim=0),
-                *zip([b_ids, data['spv_b_ids']], [i_ids, data['spv_i_ids']],
-                     [j_ids, data['spv_j_ids']], [mconf, mconf_gt]))
+            # b_ids, i_ids, j_ids, mconf = map(
+            #     lambda x, y: torch.cat([x[pred_indices], y[gt_pad_indices]],
+            #                            dim=0),
+            #     *zip([b_ids, data['spv_b_ids']], [i_ids, data['spv_i_ids']],
+            #          [j_ids, data['spv_j_ids']], [mconf, mconf_gt]))
 
         # These matches select patches that feed into fine-level network
         coarse_matches = {'b_ids': b_ids, 'i_ids': i_ids, 'j_ids': j_ids}
@@ -251,7 +329,7 @@ class CoarseMatching(nn.Module):
 
         # These matches is the current prediction (for visualization)
         coarse_matches.update({
-            'gt_mask': mconf == 0,
+            # 'gt_mask': mconf == 0,
             'm_bids': b_ids[mconf != 0],  # mconf == 0 => gt matches
             'mkpts0_c': mkpts0_c[mconf != 0],
             'mkpts1_c': mkpts1_c[mconf != 0],

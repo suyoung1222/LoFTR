@@ -20,6 +20,8 @@ from src.lightning.lightning_loftr import PL_LoFTR
 loguru_logger = get_rank_zero_only_logger(loguru_logger)
 
 
+
+
 def parse_args():
     # init a costum parser which will be added into pl.Trainer parser
     # check documentation: https://pytorch-lightning.readthedocs.io/en/latest/common/trainer.html#trainer-flags

@@ -1,4 +1,4 @@
-from .resnet_fpn import ResNetFPN_8_2, ResNetFPN_16_4
+from .resnet_fpn import ResNetFPN_8_2, ResNetFPN_16_4, ResNetFPN_32_8
 
 
 def build_backbone(config):
@@ -7,5 +7,7 @@ def build_backbone(config):
             return ResNetFPN_8_2(config['resnetfpn'])
         elif config['resolution'] == (16, 4):
             return ResNetFPN_16_4(config['resnetfpn'])
+        elif config['resolution'] == (32, 8):
+            return ResNetFPN_32_8(config['resnetfpn'])
     else:
         raise ValueError(f"LOFTR.BACKBONE_TYPE {config['backbone_type']} not supported.")
